@@ -2532,10 +2532,19 @@ struct llama_model_inkling2 : public llama_model_base {
     llama_model_inkling2(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    void post_load_tensors() override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
+
+    // projections that read the same input, stacked by rows into one matmul, keyed by their first weight:
+    // [wq; attn_rel; wqkv_gate] by wq, and [wk; wv] of a SWA layer by wk
+    std::map<const ggml_tensor *, ggml_tensor *> stacked;
+
+    // attn_rel_bias with the zero bin for out-of-range distances appended and the r clip threshold folded in,
+    // keyed by attn_rel_bias
+    std::map<const ggml_tensor *, ggml_tensor *> rel_bias_folded;
 
     // message controllers of the q, k, v and ffn inputs of a looped layer (inkling2_loop)
     enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
@@ -2550,6 +2559,7 @@ struct llama_model_inkling2 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        ggml_tensor * mix_column(ggml_tensor * mixed, int64_t j);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
@@ -2568,7 +2578,7 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [LOOP_CTRL_COUNT, n_embd, n_tokens] are mixed into its inputs
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
                 ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
