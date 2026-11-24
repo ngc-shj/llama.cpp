@@ -2327,7 +2327,86 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    post_load_tensors();
+
     return true;
+}
+
+ggml_tensor * llama_model_base::new_weight_f32(const ggml_tensor * like, int64_t ne0, int64_t ne1, const std::string & name, const float * data) {
+    if (like == nullptr || like->buffer == nullptr || ggml_backend_buffer_is_host(like->buffer)) {
+        return nullptr;
+    }
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return nullptr;
+    }
+    ggml_tensor * res = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, ne0, ne1);
+    ggml_set_name(res, name.c_str());
+    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_buffer_get_type(like->buffer)) };
+    if (!buffer) {
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_set(res, data, 0, ggml_nbytes(res));
+
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(std::move(buffer));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+    return res;
+}
+
+ggml_tensor * llama_model_base::stack_rows(const std::vector<ggml_tensor *> & parts, const std::string & name) {
+    if (parts.empty() || !hdmd.weight_blocks.empty() || !hdmd.inverse_blocks.empty()) {
+        return nullptr;
+    }
+    const ggml_tensor * first = parts[0];
+    int64_t ne1 = 0;
+    for (const ggml_tensor * t : parts) {
+        if (t == nullptr || t->type != first->type || t->ne[0] != first->ne[0] || t->ne[2] != 1 || t->ne[3] != 1 ||
+                !ggml_is_contiguous(t) || t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer) ||
+                ggml_backend_buffer_get_type(t->buffer) != ggml_backend_buffer_get_type(first->buffer) ||
+                get_w_scale(t) != nullptr) {
+            return nullptr;
+        }
+        ne1 += t->ne[1];
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    if (!ctx) {
+        return nullptr;
+    }
+    ggml_tensor * res = ggml_new_tensor_2d(ctx.get(), first->type, first->ne[0], ne1);
+    ggml_set_name(res, name.c_str());
+
+    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), ggml_backend_buffer_get_type(first->buffer)) };
+    if (!buffer) {
+        return nullptr;
+    }
+    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<uint8_t> data;
+    size_t offs = 0;
+    for (const ggml_tensor * t : parts) {
+        data.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, data.data(), 0, data.size());
+        ggml_backend_tensor_set(res, data.data(), offs, data.size());
+        offs += data.size();
+    }
+
+    std::vector<ggml_backend_buffer_ptr> buffers;
+    buffers.emplace_back(std::move(buffer));
+    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+    return res;
 }
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)

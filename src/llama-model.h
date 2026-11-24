@@ -1094,6 +1094,9 @@ struct llama_model {
     // optional, runs after the scale pass
     virtual void post_arch_tensors(llama_model_loader &) {}
 
+    // optional, runs after the tensor data is loaded
+    virtual void post_load_tensors() {}
+
 protected:
     llama_model_params params;
 
@@ -1149,6 +1152,13 @@ struct llama_model_base : public llama_model {
 
     // helper: make the prism.hadamard rotation and sign tensors for the folded weights
     void load_tensors_hadamard();
+
+    // helper: a copy of 2D weights of one type and row length stacked by rows, in the buffer type of the first,
+    // or nullptr when they cannot be stacked (other types or shapes, host or repacked buffers, scales, Hadamard)
+    ggml_tensor * stack_rows(const std::vector<ggml_tensor *> & parts, const std::string & name);
+
+    // helper: a new 2D F32 weight from host data, in the device buffer type of `like`, or nullptr on a host buffer
+    ggml_tensor * new_weight_f32(const ggml_tensor * like, int64_t ne0, int64_t ne1, const std::string & name, const float * data);
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
