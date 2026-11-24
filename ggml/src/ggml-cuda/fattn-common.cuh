@@ -40,7 +40,18 @@ typedef void (* fattn_kernel_t)(
                             const int32_t nb11, const int32_t nb12, const int64_t nb13,
                             const int32_t nb21, const int32_t nb22, const int64_t nb23,
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int64_t nb32, const int64_t nb33);
+                            const int32_t nb31, const int64_t nb32, const int64_t nb33,
+        const char * bias_table, const char * bias_idx,
+        const int64_t bias_tb_nb1, const int64_t bias_tb_nb2, const int64_t bias_ix_nb1);
+
+// the indexed bias of FLASH_ATTN_EXT (ggml_flash_attn_ext_add_indexed_bias) for one (sequence, head):
+// table[idx[q*idx_stride + k] + q*table_stride] is added to the mask of query row q and key k
+struct fattn_bias {
+    const float   * table        = nullptr; // at the head and the first query of the sequence
+    const int32_t * idx          = nullptr; // at the first query of the sequence
+    int64_t         table_stride = 0;       // floats per query
+    int64_t         idx_stride   = 0;       // indices per query
+};
 
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
@@ -1324,7 +1335,9 @@ void launch_fattn(
         K->ne[0], n_kv, K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
         mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        KQV->src[6] ? (const char *) KQV->src[6]->data : nullptr, KQV->src[7] ? (const char *) KQV->src[7]->data : nullptr,
+        KQV->src[6] ? KQV->src[6]->nb[1] : 0, KQV->src[6] ? KQV->src[6]->nb[2] : 0, KQV->src[7] ? KQV->src[7]->nb[1] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 
