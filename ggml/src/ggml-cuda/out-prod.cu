@@ -51,6 +51,13 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     cudaStream_t   stream = ctx.stream();
     cublasHandle_t handle = ctx.cublas_handle();
 
+    // an F32 op: no TF32 for the GEMM, the handle is restored to the TF32 default from common.cuh on return
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+    struct restore_math_mode {
+        cublasHandle_t handle;
+        ~restore_math_mode() { cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH); }
+    } restore { handle };
+
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
