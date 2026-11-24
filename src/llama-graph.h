@@ -1101,6 +1101,14 @@ struct llm_graph_amax_src1 {
 struct llm_graph_context {
     const llama_model & model;
 
+    // F32 copies of the input masks, made once per graph (build_attn with a relative-position bias)
+    mutable std::map<ggml_tensor *, ggml_tensor *> mask_f32;
+
+    // set by a model around build_attn: the flash attention node gathers table[idx[key, query], head, query]
+    // into its mask (ggml_flash_attn_ext_add_indexed_bias) instead of reading a per-head mask
+    mutable ggml_tensor * fa_bias_table = nullptr;
+    mutable ggml_tensor * fa_bias_idx   = nullptr;
+
     const llama_hparams & hparams;
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
