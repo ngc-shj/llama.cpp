@@ -1946,7 +1946,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const int64_t n_expert = w_s->ne[0];
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        // get_rows needs one batch of rows per token, a single token gathers from the scales directly
+        if (n_tokens > 1) {
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        }
         s = ggml_get_rows(ctx0, s, ids);
         res = ggml_mul(ctx0, res, s);
     }
@@ -3193,6 +3196,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
+        if (fa_bias_table) {
+            ggml_flash_attn_ext_add_indexed_bias(cur, fa_bias_table, fa_bias_idx);
+        }
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
         ggml_prec_set_acc(cur, GGML_PREC_F32);
@@ -4470,8 +4476,21 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;
+    if (kq_b == nullptr) {
+        // the bias comes as an indexed bias of the flash attention node (fa_bias_table), the mask stays per sequence
+        GGML_ASSERT(cparams.flash_attn && fa_bias_table);
+        if (kq_mask->type != GGML_TYPE_F16) {
+            kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+        }
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    }
     if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        // every layer adds its bias to the same input mask, cast it once per graph
+        ggml_tensor *& f32 = mask_f32[kq_mask];
+        if (!f32) {
+            f32 = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+        }
+        kq_mask = f32;
     }
     kq_mask = ggml_add(ctx0, kq_b, kq_mask);
     if (cparams.flash_attn) {
