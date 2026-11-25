@@ -116,6 +116,11 @@ void ggml_cuda_op_ssm_conv_update_res(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(state_dst->type == GGML_TYPE_F32 && ggml_nelements(state_dst) == (int64_t) (d_conv - 1)*nr*n_s);
     GGML_ASSERT(norm == 0 || nr % SSM_CONV_UPDATE_THREADS == 0);
 
+    // the token stride of out: [nr, n_tokens], or [head size, n_heads, n_tokens] after a head norm
+    GGML_ASSERT(out->ne[0] == nr || out->ne[0]*out->ne[1] == nr);
+    const int64_t out_nb_tok = out->ne[0] == nr ? out->nb[1] : out->nb[2];
+    GGML_ASSERT(!res2 || res2->ne[0] == nr);
+
     const int threads = SSM_CONV_UPDATE_THREADS;
     const dim3 blocks((nr + threads - 1)/threads, n_s, 1);
     cudaStream_t stream = ctx.stream();
@@ -129,7 +134,7 @@ void ggml_cuda_op_ssm_conv_update_res(ggml_backend_cuda_context & ctx,
         res2 ? (const char *) res2->data : nullptr, res2 ? res2->nb[1] : 0, \
         dyn ? (const char *) dyn->data : nullptr, dyn ? dyn->nb[1] : 0, head_size, \
         (char *) state_dst->data, state_dst->nb[1], \
-        (char *) out->data, out->nb[1], \
+        (char *) out->data, out_nb_tok, \
         nr, n_t, scale, eps)
 #define SSM_CONV_UPDATE_RES_NORM(DC) \
     switch (norm) { \
