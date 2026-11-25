@@ -4630,7 +4630,7 @@ static bool ggml_cuda_match_ssm_conv_update_res(const ggml_cgraph * cgraph, int 
     const ggml_tensor * xt   = concat->src[1];
     const int64_t n_t = xt->ne[0];
     if (ggml_get_op_params_i32(concat, 0) != 0 || concat->type != GGML_TYPE_F32 || past->type != GGML_TYPE_F32 ||
-            xt->type != GGML_TYPE_F32 || n_t > 32 || conv->src[0] != concat || conv->src[1]->ne[0] != past->ne[0] + 1) {
+            xt->type != GGML_TYPE_F32 || n_t > 1 || conv->src[0] != concat || conv->src[1]->ne[0] != past->ne[0] + 1) {
         return false;
     }
     // the state copy takes the last d_conv - 1 columns of the concat
