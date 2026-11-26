@@ -237,6 +237,55 @@ common_memory_reports common_measure_memory(common_params & params) {
     return res;
 }
 
+// memory of a model whose context reads the main context (ctx_other, e.g. a DFlash/DSpark draft):
+// it cannot be created alone, so it is measured against a main context that allocates nothing
+static std::vector<llama_device_memory_data> common_get_device_memory_data_with_main(
+        const std::vector<std::string> & paths_main,
+        const llama_model_params * mparams_main,
+        const llama_context_params * cparams_main,
+        const common_fit_extra_model * extra,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        uint32_t & hp_ngl_skip,
+        uint32_t & hp_n_ctx_train,
+        uint32_t & hp_n_expert,
+        ggml_log_level log_level) {
+    common_fit_log_scope log_scope(log_level);
+
+    llama_model_params mparams_copy = *mparams_main;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    llama_model * model = common_model_load(paths_main, mparams_copy);
+    if (model == nullptr) {
+        throw std::runtime_error("failed to load the main model");
+    }
+
+    llama_context * ctx = llama_init_from_model(model, *cparams_main);
+    if (ctx == nullptr) {
+        llama_model_free(model);
+        throw std::runtime_error("failed to create the main llama_context");
+    }
+
+    llama_context_params cparams_extra = *extra->cparams;
+    cparams_extra.ctx_other = ctx;
+
+    std::vector<llama_device_memory_data> ret;
+    try {
+        ret = common_get_device_memory_data_impl(
+            extra->paths_model, extra->mparams, &cparams_extra, devs, hp_ngl, hp_ngl_skip, hp_n_ctx_train, hp_n_expert, log_level);
+    } catch (...) {
+        llama_free(ctx);
+        llama_model_free(model);
+        throw;
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
+
+    return ret;
+}
+
 common_device_memory_data_vec common_get_device_memory_data(
         const std::vector<std::string> & paths_model,
         const llama_model_params * mparams,
@@ -307,8 +356,13 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
-                measured = common_get_device_memory_data_impl(
-                    extra->paths_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                try {
+                    measured = common_get_device_memory_data_impl(
+                        extra->paths_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                } catch (const std::runtime_error &) {
+                    measured = common_get_device_memory_data_with_main(paths_model, mparams, cparams,
+                        extra, devs_extra, ngl_extra, nsk_extra, nct_extra, nex_extra, log_level);
+                }
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
