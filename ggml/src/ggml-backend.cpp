@@ -2125,10 +2125,13 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         }
     }
 
-    if ((input->flags & GGML_TENSOR_FLAG_INPUT) && split_backend->iface.set_tensor_async != NULL &&
+    // a CPU split has finished computing when its compute call returns, so its outputs are as ready as user inputs
+    const bool from_cpu = input_backend && ggml_backend_get_device(input_backend) &&
+        ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    if (((input->flags & GGML_TENSOR_FLAG_INPUT) || from_cpu) && split_backend->iface.set_tensor_async != NULL &&
             input->buffer && ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input) &&
             input_cpy->buffer && !ggml_backend_buffer_is_host(input_cpy->buffer)) {
-        // queue the copy on the split backend: one wait for the backend before the first user input of the split,
+        // queue the copy on the split backend: one wait for the backend before the first such input of the split,
         // and one synchronize after the last (ggml_backend_sched_compute_splits), instead of two host round trips
         // per input, which cost ~150 us each on WDDM/WSL2 or over an eGPU link
         if (!sched->user_inputs_queued) {
