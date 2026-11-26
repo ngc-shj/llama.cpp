@@ -1,6 +1,6 @@
 #include "gated-control.cuh"
 
-// a low-rank gate on two vectors, for one token:
+// a low-rank gate on two vectors, per token:
 //   h   = down^T [rms_norm(cur); rms_norm(msg)]           down [2n, rank]
 //   out = cur - tanh(forget^T h)*cur + tanh(gain^T h)*msg  forget, gain [rank, n]
 // two kernels: the down projection needs all of both norms, the gated mix needs all of h
@@ -22,13 +22,17 @@ static __device__ float block_reduce_sum(float v, float * red) {
     return v;
 }
 
-// one block per output r of the down projection; every block normalizes both inputs itself
+// one block per output r of the down projection and token; every block normalizes both inputs itself
 static __global__ void gated_control_down_f32(
         const float * __restrict__ cur, const float * __restrict__ msg, const float eps,
         const char * __restrict__ down, const int64_t down_nb1,
         float * __restrict__ h, const int n) {
     __shared__ float red[32];
-    const int r = blockIdx.x;
+    const int r    = blockIdx.x;
+    const int rank = gridDim.x;
+    cur += (int64_t) blockIdx.y*n;
+    msg += (int64_t) blockIdx.y*n;
+    h   += (int64_t) blockIdx.y*rank;
 
     float sc = 0.0f, sm = 0.0f;
     for (int i = threadIdx.x; i < n; i += GATED_CONTROL_THREADS) {
@@ -62,6 +66,10 @@ static __global__ void gated_control_mix_f32(
     if (e >= n) {
         return;
     }
+    cur += (int64_t) blockIdx.y*n;
+    msg += (int64_t) blockIdx.y*n;
+    out += (int64_t) blockIdx.y*n;
+    h   += (int64_t) blockIdx.y*rank;
     const float * wf = (const float *) (forget + e*forget_nb1);
     const float * wg = (const float *) (gain   + e*gain_nb1);
     float f = 0.0f, g = 0.0f;
@@ -83,19 +91,20 @@ void ggml_cuda_op_gated_control(ggml_backend_cuda_context & ctx,
         const ggml_tensor * forget, const ggml_tensor * gain, ggml_tensor * out) {
     const int n    = (int) cur->ne[0];
     const int rank = (int) down->ne[1];
+    const int n_t  = (int) (ggml_nelements(cur)/n);
 
     GGML_ASSERT(ggml_is_contiguous(cur) && ggml_is_contiguous(msg) && ggml_is_contiguous(h) && ggml_is_contiguous(out));
     GGML_ASSERT(down->ne[0] == 2*n && forget->ne[0] == rank && gain->ne[0] == rank && forget->ne[1] == n && gain->ne[1] == n);
 
     cudaStream_t stream = ctx.stream();
 
-    gated_control_down_f32<<<rank, GATED_CONTROL_THREADS, 0, stream>>>(
+    gated_control_down_f32<<<dim3(rank, n_t), GATED_CONTROL_THREADS, 0, stream>>>(
         (const float *) cur->data, (const float *) msg->data, eps,
         (const char *) down->data, down->nb[1],
         (float *) h->data, n);
 
     const int warps = 8;
-    gated_control_mix_f32<<<(n + warps - 1)/warps, warps*WARP_SIZE, 0, stream>>>(
+    gated_control_mix_f32<<<dim3((n + warps - 1)/warps, n_t), warps*WARP_SIZE, 0, stream>>>(
         (const float *) cur->data, (const float *) msg->data, (const float *) h->data,
         (const char *) forget->data, forget->nb[1],
         (const char *) gain->data,   gain->nb[1],

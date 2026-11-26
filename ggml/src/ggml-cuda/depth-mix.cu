@@ -1,6 +1,6 @@
 #include "depth-mix.cuh"
 
-// softmax attention of a few queries over a short stack of states, for one token:
+// softmax attention of a few queries over a short stack of states, per token (one block each):
 //   xn     = rms_norm(x)                                   x [n]
 //   states = [stack_0 .. stack_{nb-1}, xn]                 stack columns [n] with stride stack_nb1
 //   p      = softmax_b(scale*states^T q)                   q [n, nq]
@@ -10,13 +10,23 @@ static constexpr int DEPTH_MIX_THREADS = 512;
 
 static __global__ void depth_mix_f32(
         const float * __restrict__ x, const float eps, float * __restrict__ xn_out, const float * __restrict__ xn_in,
-        const char * __restrict__ stack, const int64_t stack_nb1, const int nb,
-        const char * __restrict__ q, const int64_t q_nb1, const int nq,
+        const int64_t x_nbt, const int64_t xn_out_nbt, const int64_t xn_in_nbt,
+        const char * __restrict__ stack, const int64_t stack_nb1, const int64_t stack_nb2, const int nb,
+        const char * __restrict__ q, const int64_t q_nb1, const int64_t q_nb2, const int nq,
         const float scale,
-        char * __restrict__ out, const int64_t out_nb1,
+        char * __restrict__ out, const int64_t out_nb1, const int64_t out_nb2,
         const int n,
         const float * __restrict__ nw, const float neps, float * __restrict__ nout) {
     extern __shared__ float smem[];
+    {
+        const int64_t t = blockIdx.x;
+        x      = x      ? (const float *) ((const char *) x      + t*x_nbt)      : nullptr;
+        xn_out = xn_out ? (float *)       ((char *)       xn_out + t*xn_out_nbt) : nullptr;
+        xn_in  = xn_in  ? (const float *) ((const char *) xn_in  + t*xn_in_nbt)  : nullptr;
+        stack += t*stack_nb2;
+        q     += t*q_nb2;
+        out   += t*out_nb2;
+    }
     float * xn  = smem;          // [n]
     float * red = xn + n;        // [32]
     float * p   = red + 32;      // [(nb + 1)*nq]
@@ -151,19 +161,23 @@ void ggml_cuda_op_depth_mix(ggml_backend_cuda_context & ctx,
     const int nb = (int) stack->ne[1];
     const int nq = (int) q->ne[1];
 
-    GGML_ASSERT(nq <= GGML_CUDA_DEPTH_MIX_MAX_Q && ggml_is_contiguous(x) && ggml_is_contiguous(norm));
+    GGML_ASSERT(nq <= GGML_CUDA_DEPTH_MIX_MAX_Q && ggml_is_contiguous_rows(x) && ggml_is_contiguous(norm));
     GGML_ASSERT(stack->nb[0] == sizeof(float) && q->nb[0] == sizeof(float) && out->nb[0] == sizeof(float));
 
     const float eps   = ggml_get_op_params_f32(norm, 0);
     const float scale = ggml_get_op_params_f32(softmax, 0);
 
+    const int n_t = (int) out->ne[2];
+    GGML_ASSERT(!nout || n_t == 1);
+
     const size_t smem = (2*n + 32 + (nb + 1)*nq)*sizeof(float);
-    depth_mix_f32<<<1, DEPTH_MIX_THREADS, smem, ctx.stream()>>>(
+    depth_mix_f32<<<n_t, DEPTH_MIX_THREADS, smem, ctx.stream()>>>(
         (const float *) x->data, eps, (float *) norm->data, nullptr,
-        (const char *) stack->data, stack->nb[1], nb,
-        (const char *) q->data, q->nb[1], nq,
+        x->nb[2], norm->nb[2], 0,
+        (const char *) stack->data, stack->nb[1], stack->nb[2], nb,
+        (const char *) q->data, q->nb[1], 0, nq, // q is shared by the tokens
         scale,
-        (char *) out->data, out->nb[1],
+        (char *) out->data, out->nb[1], out->nb[2],
         n, nw ? (const float *) nw->data : nullptr, neps, nout ? (float *) nout->data : nullptr);
 }
 
@@ -179,12 +193,16 @@ void ggml_cuda_op_depth_mix_normed(ggml_backend_cuda_context & ctx,
 
     const float scale = ggml_get_op_params_f32(softmax, 0);
 
+    const int n_t = (int) out->ne[2];
+    GGML_ASSERT(!nout || n_t == 1);
+
     const size_t smem = (2*n + 32 + (nb + 1)*nq)*sizeof(float);
-    depth_mix_f32<<<1, DEPTH_MIX_THREADS, smem, ctx.stream()>>>(
+    depth_mix_f32<<<n_t, DEPTH_MIX_THREADS, smem, ctx.stream()>>>(
         nullptr, 0.0f, nullptr, (const float *) xn->data,
-        (const char *) stack->data, stack->nb[1], nb,
-        (const char *) q->data, q->nb[1], nq,
+        0, 0, xn->nb[2],
+        (const char *) stack->data, stack->nb[1], stack->nb[2], nb,
+        (const char *) q->data, q->nb[1], 0, nq, // q is shared by the tokens
         scale,
-        (char *) out->data, out->nb[1],
+        (char *) out->data, out->nb[1], out->nb[2],
         n, nw ? (const float *) nw->data : nullptr, neps, nout ? (float *) nout->data : nullptr);
 }

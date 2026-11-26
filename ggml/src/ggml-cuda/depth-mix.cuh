@@ -3,7 +3,8 @@
 #define GGML_CUDA_DEPTH_MIX_MAX_Q     8
 #define GGML_CUDA_DEPTH_MIX_MAX_STACK 32
 
-// fused rms_norm(x) -> concat(stack, xn) -> mul_mat(states, q) -> soft_max -> out_prod(states, p^T), one token,
+// fused rms_norm(x) -> concat(stack, xn) -> mul_mat(states, q) -> soft_max -> out_prod(states, p^T), per token
+// (several tokens: mul_mat(q, states) -> cont(transpose) -> soft_max with q shared),
 // matched in ggml_cuda_try_fuse
 void ggml_cuda_op_depth_mix(ggml_backend_cuda_context & ctx,
         const ggml_tensor * norm, const ggml_tensor * stack, const ggml_tensor * q,

@@ -223,20 +223,30 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> 
         states = ggml_concat(ctx0, mix_stack(blocks), states, 1);
     }
 
-    // one token needs no copy of the queries
-    ggml_tensor * queries = n_tokens == 1 ? query :
-        ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
-
-    ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+    // the queries broadcast over the tokens as the first operand, the scores then come out [n_queries, n_states, n_tokens]
+    // and the softmax over the states needs them transposed; one token takes the states first and needs no copy
+    ggml_tensor * scores = n_tokens == 1 ? ggml_mul_mat(ctx0, states, query) :
+        ggml_cont(ctx0, ggml_transpose(ctx0, ggml_mul_mat(ctx0, query, states)));
     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
 
     // the weighted sum over the stack as an outer product reads the states and the scores in place, no transposed copy
-    return ggml_out_prod(ctx0, states, ggml_transpose(ctx0, scores)); // [n_embd, n_queries, n_tokens]
+    ggml_tensor * mixed = ggml_out_prod(ctx0, states, ggml_transpose(ctx0, scores)); // [n_embd, n_queries, n_tokens]
+
+    // several tokens: one copy to [n_embd, n_tokens, n_queries] makes every column a contiguous view (mix_column)
+    // instead of a copy per column; a backend can write the product in that order directly
+    if (n_tokens > 1 && mixed->ne[1] > 1) {
+        mixed = ggml_cont(ctx0, ggml_permute(ctx0, mixed, 0, 2, 1, 3));
+    }
+    return mixed;
 }
 
 // column j of a mix() result, [n_embd, n_tokens]; one token is a contiguous view
 ggml_tensor * llama_model_inkling2::graph::mix_column(ggml_tensor * mixed, int64_t j) {
-    ggml_tensor * col = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]);
+    // [n_embd, n_queries, n_tokens], or the [n_embd, n_tokens, n_queries] copy mix() makes for several tokens
+    const bool by_query = mixed->op == GGML_OP_CONT && mixed->src[0]->op == GGML_OP_PERMUTE;
+    ggml_tensor * col = by_query
+        ? ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], j*mixed->nb[2])
+        : ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], j*mixed->nb[1]);
     return ggml_is_contiguous(col) ? col : ggml_cont(ctx0, col);
 }
 
@@ -262,7 +272,8 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
     ggml_tensor * past = ggml_view_3d(ctx0, history, n_conv - 1, n_channels, n_seqs, history->nb[1], history->nb[2], offset*history->nb[1]);
 
-    ggml_tensor * x = ggml_transpose(ctx0, ggml_reshape_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs));
+    // cur may be a strided view of a stacked product: view it per sequence rather than reshape
+    ggml_tensor * x = ggml_transpose(ctx0, ggml_view_3d(ctx0, cur, n_channels, n_seq_tokens, n_seqs, cur->nb[1], cur->nb[1]*n_seq_tokens, 0));
     x = ggml_concat(ctx0, past, x, 0);
 
     build_conv_state_store(inp, state, x, n_conv - 1, offset*(n_conv - 1)*ggml_element_size(state));
@@ -387,10 +398,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     {
         const auto & m = static_cast<const llama_model_inkling2 &>(model);
 
-        // rows [offs, offs + n) of a stacked product, [n, n_tokens]
-        auto rows = [&](ggml_tensor * prod, int64_t offs, int64_t n) {
+        // rows [offs, offs + n) of a stacked product, [n, n_tokens]; one token is a contiguous view, a few tokens
+        // stay a strided view where the consumers take one (q, r, k, v), the gate and a prefill batch get a copy
+        auto rows = [&](ggml_tensor * prod, int64_t offs, int64_t n, bool keep_view = true) {
             ggml_tensor * v = ggml_view_2d(ctx0, prod, n, n_tokens, prod->nb[1], offs*ggml_element_size(prod));
-            return ggml_is_contiguous(v) ? v : ggml_cont(ctx0, v);
+            return (keep_view && n_tokens <= 16) || ggml_is_contiguous(v) ? v : ggml_cont(ctx0, v);
+        };
+        // [a, b, n_tokens] of a [a*b, n_tokens] view, without a copy
+        auto heads = [&](ggml_tensor * t, int64_t a, int64_t b) {
+            return ggml_view_3d(ctx0, t, a, b, n_tokens, a*ggml_element_size(t), t->nb[1], 0);
         };
         auto stacked = [&](const ggml_tensor * w) {
             const auto it = m.stacked.find(w);
@@ -404,7 +420,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             const int64_t n_q = layer.wq->ne[1], n_r = layer.attn_rel->ne[1];
             q_raw = rows(prod, 0,         n_q);
             r_raw = rows(prod, n_q,       n_r);
-            g_raw = rows(prod, n_q + n_r, layer.wqkv_gate->ne[1]);
+            g_raw = rows(prod, n_q + n_r, layer.wqkv_gate->ne[1], false);
         } else {
             q_raw = build_lora_mm(layer.wq,        inputs[0]);
             r_raw = build_lora_mm(layer.attn_rel,  inputs[0]);
@@ -436,10 +452,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         ggml_tensor * Rcur = r_raw;
 
         // the q and k clips share the threshold t, folded into the attention scale: clip(q)·clip(k) = t²*l2_norm(q, t)·l2_norm(k, t)
-        Qcur = ggml_l2_norm(ctx0, ggml_mul(ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), layer.attn_q_clip), qk_clip);
+        Qcur = ggml_l2_norm(ctx0, ggml_mul(ctx0, heads(Qcur, n_embd_head, n_head), layer.attn_q_clip), qk_clip);
         const auto it_rb = m.rel_bias_folded.find(layer.attn_rel_bias);
         ggml_tensor * rel_bias = it_rb != m.rel_bias_folded.end() ? it_rb->second : nullptr;
-        Rcur = ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens);
+        Rcur = heads(Rcur, hparams.n_relative, n_head);
         Rcur = rel_bias ? ggml_l2_norm(ctx0, ggml_mul(ctx0, Rcur, layer.attn_rel_clip), hparams.f_relative_clip)
                         : clip(Rcur, layer.attn_rel_clip, hparams.f_relative_clip);
 
@@ -465,9 +481,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         // the sink logit t is per query: exp(s - t)/(1 + sum(exp(s - t))) = exp(s)/(exp(t) + sum(exp(s))), with a zero sink
         table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-        // prefill with flash attention: the kernel gathers the bias by distance itself, no [n_kv, n_tokens, n_head] mask
+        // prefill with flash attention: the kernel gathers the bias by distance itself, no [n_kv, n_tokens, n_head] mask;
+        // a few tokens take the small mask and the vector kernels
         ggml_tensor * kq_b = nullptr;
-        if (cparams.flash_attn && n_tokens > 1) {
+        if (cparams.flash_attn && n_tokens > 16) {
             fa_bias_table = table;
             fa_bias_idx   = rel_pos;
         } else {
